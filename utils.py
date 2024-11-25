@@ -1,4 +1,6 @@
+import tqdm
 import numpy as np
+import torch
 import skimage.measure as measure
 import shapely.geometry as shapely
 import matplotlib.pyplot as plt
@@ -95,8 +97,8 @@ def calculate_sdf(
     x_dist_pairs = grid[:, None] - x[None, :]
     y_dist_pairs = grid[:, None] - y[None, :]
 
-    x_mesh = np.repeat(x_dist_pairs[:, None, :], sdf_resolution, axis=1)
-    y_mesh = np.repeat(y_dist_pairs[None, :, :], sdf_resolution, axis=0)
+    x_mesh = x_dist_pairs[:, None, :]
+    y_mesh = y_dist_pairs[None, :, :]
 
     # we get the distance between each point in the grid to the shape at any time t
     sq_dist_mesh = np.add(
@@ -110,9 +112,10 @@ def calculate_sdf(
 
     # we calculate the sign of the sdf using shapely, as I couldn't find a way to vectorize this
     signs = np.empty((sdf_resolution, sdf_resolution), dtype=bool)
+    _shape = shapely.Polygon(shape.T)
     for x_idx, x_coord in enumerate(grid):
         for y_idx, y_coord in enumerate(grid):
-            signs[x_idx, y_idx] = shapely.Polygon(shape.T).contains(shapely.Point(x_coord, y_coord))
+            signs[x_idx, y_idx] = _shape.contains(shapely.Point(x_coord, y_coord))
 
     # nore really sure where the rotation and flipping of the images occurs
     udf = udf.T[::-1]
@@ -180,4 +183,149 @@ def get_prototype_shape(
     mean_sdf = np.sum(sdfs, axis=0)
     contours = measure.find_contours(mean_sdf, 0)
     prototype = 2 * max_radius * (max(contours, key=len).T / sdf_resolution - .5)
-    return ((1,), (-1,)) * prototype[::-1]
+    prototype = ((1,), (-1,)) * prototype[::-1]
+    
+    # align the shape
+    if not np.all(np.sort(np.atan2(*prototype)) == np.atan2(*prototype)):
+        taos = np.atan2(*np.concat((prototype[:, [-1]], prototype), axis=1))
+        roll_val = prototype.shape[1] - np.diff(taos).argmax()
+        prototype = np.roll(prototype, roll_val, axis=1,)
+        taos = np.atan2(*prototype)
+
+        if np.diff(taos).mean() < 0:
+            prototype = np.flip(prototype, axis=1)
+            taos = np.atan2(*prototype)
+        assert (np.sort(taos) == taos).all(), 'The shape is not star-convex with s_0=(0,0), I think?'
+
+    return prototype
+
+
+def project_shape_torch(
+    shape: torch.Tensor,
+    *,
+    reference_shape: torch.Tensor,
+    reference_taos: torch.Tensor
+) -> torch.Tensor:
+    """
+    this is used as part of the optimization, bind the references using functools.partial
+    """
+    
+    # calculate a mapping between old and new coords
+    new_taos = torch.atan2(*shape)
+    upper_idxs = torch.searchsorted(reference_taos, new_taos, side='right')
+    lower_idxs = upper_idxs - 1
+    tao_lower = reference_taos[lower_idxs]
+    tao_upper = reference_taos[upper_idxs]
+
+    interps = (new_taos - tao_lower) / (tao_upper - tao_lower)
+
+    # map the shape
+    shape_proj = reference_shape[:, lower_idxs] * (1 - interps) + reference_shape[:, upper_idxs] * interps
+
+    return shape_proj
+
+
+def fit_shape(
+    prototype_shape: np.ndarray,
+    orig_shape: np.ndarray,
+    *,
+    num_max_steps: int = 10_000,
+    return_energies: bool = False,
+) -> np.ndarray | tuple[np.ndarray, np.ndarray]:
+
+    orig_shape = torch.from_numpy(orig_shape.copy())
+
+
+    # pad the shape
+    taos = np.atan2(*prototype_shape)
+    assert np.all(np.sort(taos) == taos), 'The prototype shape is not star-convex with s_0=(0,0), I think?'
+    offset = ((taos.min() == -np.pi) or (taos.max() == np.pi)).astype(int) + 1
+    reference_shape = torch.from_numpy(np.concatenate((prototype_shape[:, -offset:], prototype_shape, prototype_shape[:, :offset]), axis=1))
+    reference_taos = torch.from_numpy(np.concatenate((taos[-offset:] - 2 * np.pi, taos, taos[:offset] + 2 * np.pi)))
+    assert (reference_taos.min() < -np.pi) and (reference_taos.max() > np.pi), 'Assumptions not met'
+
+    orig_shape_proj = project_shape_torch(
+        orig_shape,
+        reference_shape=reference_shape,
+        reference_taos=reference_taos)
+
+    shape_proj = torch.nn.parameter.Parameter(orig_shape_proj.clone())
+
+    energies = torch.full((num_max_steps+1,), np.nan)
+    optimizer = torch.optim.Adam([shape_proj], lr=1e-3)
+    for i in tqdm.trange(1, num_max_steps+1):
+        optimizer.zero_grad()
+
+        _shape_proj = project_shape_torch(
+            shape_proj,
+            reference_shape=reference_shape,
+            reference_taos=reference_taos
+        )
+        energy = torch.square(
+            _shape_proj - torch.roll(_shape_proj, 1, dims=1)).sum(dim=0).mean()
+        energies[i] = energy.item()
+        energy.backward()
+        optimizer.step()
+
+        if i % 100 == 0 and abs(energies[i] - energies[i - 99]) < 1e-7:
+            break
+
+    shape_proj = project_shape_torch(
+        shape_proj.detach(),
+        reference_shape=reference_shape,
+        reference_taos=reference_taos).numpy()
+    
+    energies = energies[1:i].numpy()
+    if return_energies:
+        return shape_proj, energies
+    return shape_proj
+
+
+def project_shape(
+    proj_shape: np.ndarray,
+    *,
+    reference_shape: np.ndarray,
+    extrat_vals: np.ndarray|None = None,
+) -> np.ndarray:
+# ) -> tuple[np.ndarray, np.ndarray]:
+    """
+    this is used as part of the optimization, bind the references using functools.partial
+    """
+    extrat_vals = reference_shape if extrat_vals is None else extrat_vals
+
+    # align the shape
+    if not np.all(np.sort(np.atan2(*reference_shape)) == np.atan2(*reference_shape)):
+        taos = np.atan2(*np.concat((reference_shape[:, [-1]], reference_shape), axis=1))
+        roll_val = reference_shape.shape[1] - np.diff(taos).argmax()
+        reference_shape = np.roll(reference_shape, roll_val, axis=1)
+        extrat_vals = np.roll(extrat_vals, roll_val, axis=1)
+        taos = np.atan2(*reference_shape)
+
+        if np.diff(taos).mean() < 0:
+            reference_shape = np.flip(reference_shape, axis=1)
+            extrat_vals = np.flip(extrat_vals, axis=1)
+            taos = np.atan2(*reference_shape)
+        assert (np.sort(taos) == taos).all(), "The reference is not sorted"
+
+    # calculate the padding
+    offset = ((taos.min() == -np.pi) or (taos.max() == np.pi)).astype(int) + 1
+
+    # pad the reference shape
+    reference_shape = np.concatenate((reference_shape[:, -offset:], reference_shape, reference_shape[:, :offset]), axis=1)
+    extrat_vals = np.concatenate((extrat_vals[:, -offset:], extrat_vals, extrat_vals[:, :offset]), axis=1)
+    reference_taos = np.concatenate((taos[-offset:] - 2 * np.pi, taos, taos[:offset] + 2 * np.pi))
+    assert (reference_taos.min() < -np.pi) or (reference_taos.max() > np.pi), 'Assumptions not met'
+    
+    # calculate a mapping between old and new coords
+    new_taos = np.atan2(*proj_shape)
+    upper_idxs = np.searchsorted(reference_taos, new_taos, side='right')
+    lower_idxs = upper_idxs - 1
+    tao_lower = reference_taos[lower_idxs]
+    tao_upper = reference_taos[upper_idxs]
+
+    interps = (new_taos - tao_lower) / (tao_upper - tao_lower)
+
+    # project the shape
+    shape_proj = extrat_vals[:, lower_idxs] * (1 - interps) + extrat_vals[:, upper_idxs] * interps
+
+    return shape_proj
